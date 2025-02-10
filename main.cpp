@@ -166,7 +166,7 @@ vector<uint8_t> modify_beacon_frame(const vector<uint8_t>& dot11_frame, const un
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         cerr << "syntax : csa-attack <interface> <ap mac> [<station mac>]" << endl;
-        cerr << "syntax: csa-attack <interface> <ap mac> [<station mac>]" << endl;
+        cerr << "sample : csa-attack mon0 00:11:22:33:44:55 66:77:88:99:AA:BB" << endl;
         return 1;
     }
 
